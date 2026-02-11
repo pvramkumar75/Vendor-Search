@@ -8,6 +8,7 @@ const API_URL = "https://api.deepseek.com/chat/completions";
 
 export const chatWithDeepSeek = async (messages: any[]): Promise<ChatResponse> => {
     try {
+        console.log(`Calling DeepSeek API with ${messages.length} messages...`);
         const response = await fetch(API_URL, {
             method: "POST",
             headers: {
@@ -82,6 +83,7 @@ export const chatWithDeepSeek = async (messages: any[]): Promise<ChatResponse> =
         if (!response.ok) {
             throw new Error(`API Error: ${response.statusText}`);
         }
+        console.log(`DeepSeek API response status: ${response.status}`);
 
         const data = await response.json();
         const content = data.choices[0].message.content;
