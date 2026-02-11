@@ -28,7 +28,7 @@ const sessions: Record<number, ChatSession> = {};
 
 console.log('🤖 Vendor Finder Bot is starting...');
 
-bot.on('message', async (msg) => {
+bot.on('message', async (msg: TelegramBot.Message) => {
     const chatId = msg.chat.id;
     const text = msg.text;
 
@@ -79,7 +79,7 @@ bot.on('message', async (msg) => {
             await bot.sendMessage(chatId, response.message, { parse_mode: 'Markdown' });
         } catch (error) {
             // Fallback to plain text if Markdown parsing fails (common with special chars)
-            console.warn('Markdown parsing failed, sending plain text:', error.message);
+            console.warn('Markdown parsing failed, sending plain text:', (error as Error).message);
             await bot.sendMessage(chatId, response.message);
         }
 
