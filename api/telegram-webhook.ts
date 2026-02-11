@@ -2,6 +2,7 @@
 import path from 'path';
 import * as dotenv from 'dotenv';
 import TelegramBot from 'node-telegram-bot-api';
+import { kv } from '@vercel/kv';
 
 // For Vercel Serverless compatibility, we manually load .env if present
 try {
@@ -74,19 +75,23 @@ export default async function handler(req: any, res: any) {
 async function processMessage(bot: TelegramBot, chatId: number, text: string) {
     if (!text) return;
 
+    const sessionKey = `chat_session:${chatId}`;
+
     // Handle commands
     if (text.startsWith('/start')) {
+        await kv.del(sessionKey); // Clear session on start
         await bot.sendMessage(chatId,
             "👋 Hello! I'm your Vendor Finder Assistant.\n\n" +
             "I can help you source suppliers for materials and products.\n" +
             "Just tell me what you're looking for! (e.g., 'I need 5000 units of SS304 valves')\n\n" +
-            "Note: I have a short memory in this mode, so please include all details in one message!"
+            "I will now remember our conversation history!"
         );
         return;
     }
 
     if (text.startsWith('/clear')) {
-        await bot.sendMessage(chatId, "🧹 Conversation history cleared (Virtual).");
+        await kv.del(sessionKey);
+        await bot.sendMessage(chatId, "🧹 Conversation history cleared.");
         return;
     }
 
@@ -98,11 +103,21 @@ async function processMessage(bot: TelegramBot, chatId: number, text: string) {
     }
 
     try {
-        // Prepare DeepSeek call
-        const messages = [
-            {
-                role: "system",
-                content: `You are an elite Lead Sourcing Manager for a global procurement firm. Your expertise lies in the Indian and Chinese manufacturing sectors.
+        // 1. Get History from KV
+        let history: any[] = await kv.get(sessionKey) || [];
+
+        // 2. Add current user message
+        history.push({ role: "user", content: text });
+
+        // 3. Limit history size (last 12 messages = 6 rounds of Q&A)
+        if (history.length > 12) {
+            history = history.slice(-12);
+        }
+
+        // 4. Prepare DeepSeek call with system prompt
+        const systemPrompt = {
+            role: "system",
+            content: `You are an elite Lead Sourcing Manager for a global procurement firm. Your expertise lies in the Indian and Chinese manufacturing sectors.
             Your role is to act as a *consultant first* and a *researcher second*. Do not just dump a list of suppliers immediately unless the user has provided comprehensive specifications.
 
             ### OPERATIONAL MODES:
@@ -155,11 +170,11 @@ async function processMessage(bot: TelegramBot, chatId: number, text: string) {
             - **Be Professional**: Use corporate, procurement-standard language.
             - **Location Sensitivity**: If user asks for "Hyderabad", prioritize Hyderabad but suggest top national alternatives if local options are poor.
             `
-            },
-            { role: "user", content: text }
-        ];
+        };
 
-        console.log(`Calling DeepSeek API with ${messages.length} messages...`);
+        const finalMessages = [systemPrompt, ...history];
+
+        console.log(`Calling DeepSeek API with ${finalMessages.length} messages (history size: ${history.length})...`);
 
         // Use Fetch
         const response = await fetch(API_URL, {
@@ -170,7 +185,7 @@ async function processMessage(bot: TelegramBot, chatId: number, text: string) {
             },
             body: JSON.stringify({
                 model: "deepseek-chat",
-                messages: messages,
+                messages: finalMessages,
                 temperature: 0.7
             })
         });
@@ -181,6 +196,12 @@ async function processMessage(bot: TelegramBot, chatId: number, text: string) {
 
         const data: any = await response.json();
         const content = data.choices[0]?.message?.content || "No response received.";
+
+        // 5. Add Assistant Response to History
+        history.push({ role: "assistant", content: content });
+
+        // 6. Save History to KV (Expires in 2 hours)
+        await kv.set(sessionKey, history, { ex: 7200 });
 
         // Parse JSON if present
         let vendors: any[] = [];
