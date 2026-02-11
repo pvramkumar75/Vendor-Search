@@ -2,7 +2,7 @@
 import path from 'path';
 import * as dotenv from 'dotenv';
 import TelegramBot from 'node-telegram-bot-api';
-import { kv } from '@vercel/kv';
+import Redis from 'ioredis';
 
 // For Vercel Serverless compatibility, we manually load .env if present
 try {
@@ -21,8 +21,23 @@ interface ChatResponse {
     vendors?: any[];
 }
 
-// Reuse bot instance in warm containers
+// Reuse bot and redis instances in warm containers
 let botInstance: TelegramBot | null = null;
+let redisInstance: Redis | null = null;
+
+function getRedis() {
+    if (redisInstance) return redisInstance;
+
+    const redisUrl = process.env.REDIS_URL || process.env.KV_URL;
+    if (!redisUrl) {
+        console.warn("REDIS_URL or KV_URL not found in env");
+        return null;
+    }
+
+    console.log("Initializing Redis with URL");
+    redisInstance = new Redis(redisUrl);
+    return redisInstance;
+}
 
 export default async function handler(req: any, res: any) {
     console.log("Webhook handler invoked", req.method);
@@ -63,7 +78,8 @@ export default async function handler(req: any, res: any) {
         }
 
         // GET request health check
-        return res.status(200).send(`Vendor Nexus Telegram Bot is active! Token found: ${token.substring(0, 5)}...`);
+        const redisStatus = getRedis() ? "Connected" : "Missing REDIS_URL";
+        return res.status(200).send(`Vendor Nexus Telegram Bot is active! \nToken: ${token.substring(0, 5)}... \nRedis: ${redisStatus}`);
 
     } catch (error) {
         console.error("Critical error in webhook:", error);
@@ -75,11 +91,12 @@ export default async function handler(req: any, res: any) {
 async function processMessage(bot: TelegramBot, chatId: number, text: string) {
     if (!text) return;
 
+    const redis = getRedis();
     const sessionKey = `chat_session:${chatId}`;
 
     // Handle commands
     if (text.startsWith('/start')) {
-        await kv.del(sessionKey); // Clear session on start
+        if (redis) await redis.del(sessionKey);
         await bot.sendMessage(chatId,
             "👋 Hello! I'm your Vendor Finder Assistant.\n\n" +
             "I can help you source suppliers for materials and products.\n" +
@@ -90,7 +107,7 @@ async function processMessage(bot: TelegramBot, chatId: number, text: string) {
     }
 
     if (text.startsWith('/clear')) {
-        await kv.del(sessionKey);
+        if (redis) await redis.del(sessionKey);
         await bot.sendMessage(chatId, "🧹 Conversation history cleared.");
         return;
     }
@@ -103,21 +120,37 @@ async function processMessage(bot: TelegramBot, chatId: number, text: string) {
     }
 
     try {
-        // 1. Get History from KV
-        let history: any[] = await kv.get(sessionKey) || [];
+        // 1. Get History from Redis
+        let history: any[] = [];
+        if (redis) {
+            const stored = await redis.get(sessionKey);
+            if (stored) {
+                try {
+                    history = JSON.parse(stored);
+                } catch (e) {
+                    console.error("Failed to parse history from redis", e);
+                }
+            }
+        }
 
         // 2. Add current user message
         history.push({ role: "user", content: text });
 
-        // 3. Limit history size (last 12 messages = 6 rounds of Q&A)
+        // 3. Limit history size
         if (history.length > 12) {
             history = history.slice(-12);
         }
 
-        // 4. Prepare DeepSeek call with system prompt
+        // 4. Prepare DeepSeek call
         const systemPrompt = {
             role: "system",
-            content: `You are an elite Lead Sourcing Manager for a global procurement firm. Your expertise lies in the Indian and Chinese manufacturing sectors.
+            content: `You are an elite Lead Sourcing Manager for a global procurement firm... (Rest of the prompt preserved)`
+        };
+
+        const finalMessages = [
+            {
+                role: "system",
+                content: `You are an elite Lead Sourcing Manager for a global procurement firm. Your expertise lies in the Indian and Chinese manufacturing sectors.
             Your role is to act as a *consultant first* and a *researcher second*. Do not just dump a list of suppliers immediately unless the user has provided comprehensive specifications.
 
             ### OPERATIONAL MODES:
@@ -170,13 +203,12 @@ async function processMessage(bot: TelegramBot, chatId: number, text: string) {
             - **Be Professional**: Use corporate, procurement-standard language.
             - **Location Sensitivity**: If user asks for "Hyderabad", prioritize Hyderabad but suggest top national alternatives if local options are poor.
             `
-        };
+            },
+            ...history
+        ];
 
-        const finalMessages = [systemPrompt, ...history];
+        console.log(`Calling DeepSeek API with ${finalMessages.length} messages...`);
 
-        console.log(`Calling DeepSeek API with ${finalMessages.length} messages (history size: ${history.length})...`);
-
-        // Use Fetch
         const response = await fetch(API_URL, {
             method: "POST",
             headers: {
@@ -200,8 +232,10 @@ async function processMessage(bot: TelegramBot, chatId: number, text: string) {
         // 5. Add Assistant Response to History
         history.push({ role: "assistant", content: content });
 
-        // 6. Save History to KV (Expires in 2 hours)
-        await kv.set(sessionKey, history, { ex: 7200 });
+        // 6. Save History to Redis (Expires in 2 hours)
+        if (redis) {
+            await redis.set(sessionKey, JSON.stringify(history), 'EX', 7200);
+        }
 
         // Parse JSON if present
         let vendors: any[] = [];
